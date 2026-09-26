@@ -1,2 +1,0 @@
-type,elapsedMs,hostElapsedMs,serverTime,payload
-created,0,,2026-09-26T09:31:49.203015+00:00,"{""protocol"": ""oriori-exploratory-v1"", ""synthetic"": true}"

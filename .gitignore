@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.next/
+.env
+python/oriori_gsr/data/
+python/oriori_gsr/static/fonts/
+analysis_summary.csv
+receipt_test.png
