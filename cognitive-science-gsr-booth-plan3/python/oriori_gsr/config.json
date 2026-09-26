@@ -1,0 +1,19 @@
+{
+  "mode": "demo",
+  "port": 8765,
+  "serialPort": "",
+  "baudRate": 115200,
+  "printer": "browser",
+  "paperWidth": "80",
+  "printerName": "",
+  "printerHost": "",
+  "printerVid": "",
+  "printerPid": "",
+  "printerInEndpoint": "0x82",
+  "printerOutEndpoint": "0x01",
+  "autoCut": true,
+  "fontPath": "assets/NanumGothic-Regular.ttf",
+  "retentionDays": 30,
+  "schoolApprovalConfirmed": false,
+  "checklist": []
+}

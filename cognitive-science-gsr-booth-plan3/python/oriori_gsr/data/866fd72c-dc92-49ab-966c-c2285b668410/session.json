@@ -1,0 +1,49 @@
+{
+  "id": "866fd72c-dc92-49ab-966c-c2285b668410",
+  "code": "ORI-005",
+  "course": "basic",
+  "status": "completed",
+  "demo": true,
+  "consent": true,
+  "aiConsent": false,
+  "researchConsent": false,
+  "answers": [
+    4,
+    3,
+    4,
+    5,
+    2,
+    2,
+    2,
+    3,
+    2,
+    4
+  ],
+  "scores": {
+    "O": 75,
+    "C": 63,
+    "E": 63,
+    "A": 88,
+    "N": 25
+  },
+  "metrics": {
+    "baseline": 28016,
+    "change": 6.2,
+    "peak": 35461,
+    "samples": 320,
+    "quality": 100,
+    "temperature": 24,
+    "humidity": 48,
+    "reactionMs": 348,
+    "duration": 16
+  },
+  "report": "오늘의 자기보고에서는 우호성이 비교적 두드러졌어요. 과제 구간에서 기준선과 다른 센서 변화가 기록되었어요. 이 기록은 지금의 작은 단면일 뿐, 당신의 가능성을 정하지 않아요.",
+  "reportSource": "rules",
+  "createdAt": "2026-09-26T08:47:14.576733+00:00",
+  "completedAt": "2026-09-26T09:31:14.576772+00:00",
+  "startedAt": null,
+  "protocol": "oriori-exploratory-v1",
+  "instrument": "original-10-exploratory-not-validated",
+  "adcUnit": "uncalibrated_u16",
+  "nominalHz": 20
+}
