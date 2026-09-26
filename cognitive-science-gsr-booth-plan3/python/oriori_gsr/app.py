@@ -1,4 +1,4 @@
-"""oriori_gsr local booth server. Operator: localhost. Participants: secret session URL."""
+"""oriori_gsr v2 local booth server. 운영자: localhost 노트북. 참가자: 세션 전용 URL(태블릿)."""
 from __future__ import annotations
 import csv
 import io
@@ -10,7 +10,6 @@ import threading
 import time
 import webbrowser
 import zipfile
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -19,15 +18,19 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 from flask import Flask, jsonify, request, send_from_directory, Response
-from engine import (DATA, Store, Collector, PRICES, PROTOCOL, INSTRUMENT, LABELS, RAW_FIELDS, EVENT_FIELDS, load_config, atomic_json, now, stages, synthetic_sample, score_answers, analyze, rule_report, generate_report, send_receipt)
+from engine import (DATA, Store, Collector, COURSES, PROTOCOL, INSTRUMENT, LABELS, RAW_FIELDS, EVENT_FIELDS, RESPONSE_FIELDS, BIG5_ITEMS, SCALE,
+                    load_config, atomic_json, now, js_round, build_script, score_answers, reference_type, compute_features, qualitative_summary,
+                    rule_report, generate_report, llm_ready, send_receipt, DEMO_PULSE)
 
 config = load_config()
 store = Store()
 collector = Collector(store, config)
 app = Flask(__name__, static_folder="static")
-app.config.update(MAX_CONTENT_LENGTH=128 * 1024, JSON_SORT_KEYS=False)
+app.config.update(MAX_CONTENT_LENGTH=256 * 1024, JSON_SORT_KEYS=False)
 app.json.ensure_ascii = False
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+ALLOW_REMOTE_OPERATOR = os.environ.get("ORIORI_ALLOW_REMOTE_OPERATOR") == "1"   # 미리보기/테스트 전용. 현장에서는 끄세요.
+PARTICIPANT_ACTIONS = {"consent", "answer", "stop", "feedback"}
 
 
 def lan_ip():
@@ -39,47 +42,40 @@ def lan_ip():
         return "127.0.0.1"
 
 
-def public_session(s):
-    return {**{k: v for k, v in s.items() if not k.startswith("_")}, "serverNow": round(time.time() * 1000), "paperWidth": config["paperWidth"], "resultUrl": f"http://{lan_ip()}:{config['port']}/result/{s['id']}"}
+def base_url():
+    return f"http://{lan_ip()}:{config['port']}"
+
+
+def public_session(s, with_script=False):
+    out = {k: v for k, v in s.items() if not k.startswith("_")}
+    out.update(serverNow=round(time.time() * 1000), hostMs=store.host_ms() if store.active == s["id"] else None,
+               paperWidth=config["paperWidth"], resultUrl=f"{base_url()}/result/{s['id']}", courseName=COURSES[s["course"]]["name"],
+               referenceType=reference_type(s.get("scores")), summary=qualitative_summary(s) if s.get("metrics") else None)
+    if with_script:
+        out["script"] = build_script(s["course"], s["demo"], s["seed"])
+    return out
 
 
 def new_session(course):
-    if course not in PRICES:
+    if course not in COURSES:
         raise ValueError("올바른 코스를 선택하세요.")
     sid = str(uuid4())
     with store.lock:
-        s = {"id": sid, "code": "ORI-" + sid[:6].upper(), "course": course, "status": "waiting", "demo": config["mode"] == "demo", "consent": False, "aiConsent": False, "researchConsent": False, "answers": [], "scores": None, "metrics": None, "report": None, "reportSource": "rules", "createdAt": now(), "completedAt": None, "startedAt": None, "protocol": PROTOCOL, "instrument": INSTRUMENT, "adcUnit": "uncalibrated_u16", "nominalHz": 20}
+        seed = len(store.all())
+        s = {"id": sid, "code": "ORI-" + sid[:6].upper(), "course": course, "status": "waiting", "demo": config["mode"] == "demo", "seed": seed,
+             "consent": False, "aiConsent": False, "researchConsent": False, "step": -1, "stepStartedMs": None,
+             "answers": {}, "answerLatency": {}, "notes": {}, "marks": {}, "scores": None, "scoreMissing": None, "metrics": None, "responses": None,
+             "report": None, "reportPending": False, "feedback": None, "createdAt": now(), "startedAt": None, "completedAt": None,
+             "protocol": PROTOCOL, "instrument": INSTRUMENT, "adcUnit": "uncalibrated_u16", "nominalHz": 20, "price": config["prices"].get(course)}
         store.save(s)
-        store.event(sid, "created", payload={"protocol": PROTOCOL, "synthetic": s["demo"]})
+        store.event(sid, "created", 0, {"protocol": PROTOCOL, "synthetic": s["demo"], "course": course})
     return s
 
 
-def seed_demo():
-    with store.lock:
-        marker = DATA / ".initialized"
-        if marker.exists():
-            return
-        if config["mode"] == "demo" and not store.all():
-            for i, course in enumerate(["basic", "full", "relation", "full", "basic", "full", "full", "relation"]):
-                s = new_session(course)
-                s["code"] = f"ORI-{i + 1:03}"
-                s["answers"] = [4, 3 + i % 2, 4, 5, 2 + i % 2, 2, 2, 3, 2, 4]
-                s["scores"] = score_answers(s["answers"])
-                seconds = sum(t for _, t in stages(course))
-                samples = [synthetic_sample(j, i) for j in range(seconds * 20)]
-                s.update(status="completed", consent=True, metrics=analyze(samples, reaction_ms=280 + i * 17), createdAt=(datetime.now(timezone.utc) - timedelta(minutes=(8 - i) * 11)).isoformat(), completedAt=now())
-                s["report"] = rule_report(s["scores"], s["metrics"])
-                store.save(s)
-                for sample in samples:
-                    store.append(s["id"], "raw.csv", RAW_FIELDS, sample)
-                store.event(s["id"], "demo_seed", payload={"synthetic": True})
-        marker.write_text("1.0", encoding="utf-8")
-
-
 def operator():
-    if request.remote_addr not in ("127.0.0.1", "::1"):
-        return jsonify(error="운영 기능은 노트북의 localhost에서만 사용할 수 있어요. 태블릿에서는 운영자가 만든 세션 QR로 입장하세요."), 403
-    return None
+    if ALLOW_REMOTE_OPERATOR or request.remote_addr in ("127.0.0.1", "::1"):
+        return None
+    return jsonify(error="운영 기능은 노트북의 localhost 에서만 쓸 수 있어요. 태블릿은 세션 QR 로 입장하세요."), 403
 
 
 @app.before_request
@@ -96,7 +92,8 @@ def same_origin():
 def privacy_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Frame-Options"] = "DENY"
+    if not ALLOW_REMOTE_OPERATOR:
+        response.headers["X-Frame-Options"] = "DENY"
     if request.path.startswith("/api/") or request.path.startswith("/result/"):
         response.headers["Cache-Control"] = "no-store"
     return response
@@ -112,19 +109,15 @@ def handle_error(exc):
     if isinstance(exc, (ValueError, KeyError, TypeError)):
         return jsonify(error=str(exc) or "입력 값을 확인해 주세요."), 400
     logging.exception("oriori operation failed")
-    return jsonify(error="작업에 실패했어요. 터미널 로그와 README를 확인하세요. 프린터 오류라면 브라우저 인쇄를 이용하세요."), 500
+    return jsonify(error="작업에 실패했어요. 터미널 로그를 확인하세요."), 500
 
 
+# ---------------------------------------------------------------- 정적 화면
 @app.get("/")
 @app.get("/tablet")
 @app.get("/result/<sid>")
 def frontend(sid=None):
     return send_from_directory(ROOT / "static", "index.html")
-
-
-@app.get("/fonts/<path:name>")
-def fonts(name):
-    return send_from_directory(ROOT / "static" / "fonts", name)
 
 
 @app.get("/icon.svg")
@@ -134,17 +127,36 @@ def icon():
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", project="oriori_gsr", mode=config["mode"])
+    return jsonify(status="ok", project="oriori_gsr", version="2.0.0", mode=config["mode"], protocol=PROTOCOL)
 
 
+@app.get("/api/qr")
+def qr_png():
+    """호출자가 준 텍스트를 QR PNG 로. 비밀을 만들지 않으므로 공개 (길이 제한)."""
+    import qrcode
+    text = request.args.get("text", "")
+    if not text or len(text) > 300:
+        raise ValueError("QR 텍스트를 확인하세요.")
+    buf = io.BytesIO()
+    qrcode.make(text, box_size=6, border=2).save(buf, format="PNG")
+    return Response(buf.getvalue(), mimetype="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/meta")
+def meta():
+    return jsonify(courses=COURSES, prices=config["prices"], items=BIG5_ITEMS, scale=SCALE, labels=LABELS, protocol=PROTOCOL, instrument=INSTRUMENT)
+
+
+# ---------------------------------------------------------------- 운영자
 @app.get("/api/workspace")
 def workspace():
     denied = operator()
     if denied:
         return denied
-    seed_demo()
-    prefs = {"demo": config["mode"] == "demo", "printer": config["printer"], "paperWidth": config["paperWidth"], "serialPort": config["serialPort"], "baudRate": str(config["baudRate"]), "checklist": config.get("checklist", [])}
-    return jsonify(sessions=[public_session(s) for s in store.all()], settings=prefs, local=True, version="1.0.0", llmAvailable=bool(os.environ.get("OPENAI_API_KEY")), tabletBase=f"http://{lan_ip()}:{config['port']}", devices={"pico": collector.status()["connected"], "printer": config["printer"] != "browser"})
+    prefs = {"demo": config["mode"] == "demo", "printer": config["printer"], "paperWidth": config["paperWidth"], "serialPort": config["serialPort"], "baudRate": str(config["baudRate"]),
+             "adcRisesWithArousal": bool(config.get("adcRisesWithArousal", True)), "schoolApprovalConfirmed": bool(config.get("schoolApprovalConfirmed")), "checklist": config.get("checklist", []), "prices": config["prices"]}
+    return jsonify(sessions=[public_session(s) for s in store.all()], settings=prefs, version="2.0.0", llmAvailable=llm_ready(), llmModel=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+                   tabletBase=base_url(), devices={"pico": collector.status()["connected"], "printer": config["printer"] != "browser"}, active=store.active, courses=COURSES)
 
 
 @app.get("/api/sensor")
@@ -171,19 +183,22 @@ def settings():
     with store.lock:
         if store.active:
             raise ValueError("측정이 끝난 뒤 설정을 바꿔 주세요.")
-        for key in ("serialPort", "printer", "paperWidth", "checklist"):
-            if key in b:
-                if key == "printer" and b[key] not in ("browser", "win32", "usb", "network"):
-                    raise ValueError("올바른 프린터 방식을 선택하세요.")
-                if key == "paperWidth" and str(b[key]) not in ("58", "80"):
-                    raise ValueError("용지 너비를 확인하세요.")
-                if key == "serialPort" and (not isinstance(b[key], str) or len(b[key]) > 80):
-                    raise ValueError("포트를 확인하세요.")
-                if key == "checklist" and (not isinstance(b[key], list) or any(type(i) is not int or not 0 <= i < 6 for i in b[key])):
-                    raise ValueError("체크리스트 형식을 확인하세요.")
-                config[key] = b[key]
+        for key in ("serialPort", "printer", "paperWidth", "checklist", "adcRisesWithArousal"):
+            if key not in b:
+                continue
+            if key == "printer" and b[key] not in ("browser", "win32", "usb", "network"):
+                raise ValueError("올바른 프린터 방식을 선택하세요.")
+            if key == "paperWidth" and str(b[key]) not in ("58", "80"):
+                raise ValueError("용지 너비를 확인하세요.")
+            if key == "serialPort" and (not isinstance(b[key], str) or len(b[key]) > 80):
+                raise ValueError("포트를 확인하세요.")
+            if key == "checklist" and (not isinstance(b[key], list) or any(type(i) is not int or not 0 <= i < 12 for i in b[key])):
+                raise ValueError("체크리스트 형식을 확인하세요.")
+            if key == "adcRisesWithArousal" and not isinstance(b[key], bool):
+                raise ValueError("극성 값은 true/false 여야 합니다.")
+            config[key] = b[key]
         atomic_json(ROOT / "config.json", config)
-    return jsonify(demo=config["mode"] == "demo", printer=config["printer"], paperWidth=config["paperWidth"], serialPort=config["serialPort"], baudRate=str(config["baudRate"]), checklist=config.get("checklist", []))
+    return jsonify(ok=True)
 
 
 @app.post("/api/sessions")
@@ -191,14 +206,36 @@ def create_session():
     denied = operator()
     if denied:
         return denied
-    return jsonify(public_session(new_session(request.get_json().get("course")))), 201
+    return jsonify(public_session(new_session(request.get_json().get("course")), True)), 201
+
+
+def finish(sid, s):
+    samples = store.raw(sid)
+    if not samples:
+        raise ValueError("기록된 센서 데이터가 없습니다. 연결을 확인하세요. (중단하면 부분 데이터는 보존됩니다)")
+    if not s["demo"] and not collector.status()["connected"]:
+        raise ValueError("센서 연결이 끊어졌습니다. 다시 연결한 뒤 완료하거나, 중단하세요.")
+    for qid, text in (s.get("notes") or {}).items():
+        store.event(sid, "note", None, {"questionId": qid, "text": text})
+    script = build_script(s["course"], s["demo"], s["seed"])
+    elapsed = store.host_ms()
+    store.event(sid, "measurement_end", None, {"synthetic": s["demo"]})
+    metrics, responses = compute_features(samples, store.event_rows(sid), script, s, bool(config.get("adcRisesWithArousal", True)))
+    metrics["observedHz"] = round(len(samples) / (elapsed / 1000), 2) if elapsed else None
+    metrics["missingSequenceCount"] = sum(max(0, int(b["seq"] - a["seq"] - 1)) for a, b in zip(samples, samples[1:]))
+    s["scores"], s["scoreMissing"] = score_answers(s.get("answers") or {})
+    s.update(metrics=metrics, responses=responses, status="completed", completedAt=now(), step=len(script) - 1)
+    s["report"] = rule_report(s)
+    s["reportPending"] = bool(s["course"] == "deep" and s["aiConsent"] and llm_ready())
+    store.active = None
+    store.pulses = []
 
 
 @app.route("/api/sessions/<sid>", methods=["GET", "PATCH", "DELETE"])
 def session_route(sid):
     s = store.get(sid)
     if request.method == "GET":
-        return jsonify(public_session(s))
+        return jsonify(public_session(s, request.args.get("script") == "1"))
     if request.method == "DELETE":
         denied = operator()
         if denied:
@@ -207,77 +244,98 @@ def session_route(sid):
         return jsonify(ok=True)
     b = request.get_json()
     action = b.get("action")
+    if action not in PARTICIPANT_ACTIONS:
+        denied = operator()
+        if denied:
+            return denied
     with store.lock:
         s = store.get(sid)
+        script = build_script(s["course"], s["demo"], s["seed"])
         if action == "consent":
             if s["status"] != "waiting":
                 raise ValueError("이미 시작한 세션입니다.")
-            s.update(consent=True, aiConsent=b.get("aiConsent") is True, status="questionnaire")
-            store.event(sid, "consent", payload={"version": "1.0", "experience": True, "research": False, "ai": s["aiConsent"]})
-        elif action == "answers":
-            if s["status"] != "questionnaire" or not s["consent"]:
-                raise ValueError("먼저 참여 동의를 확인하세요.")
-            s["scores"] = score_answers(b.get("answers"))
-            s.update(answers=b["answers"], status="ready")
+            s.update(consent=True, aiConsent=b.get("aiConsent") is True, status="consented")
+            store.event(sid, "consent", 0, {"version": "2.0", "experience": True, "research": False, "ai_claude": s["aiConsent"]})
         elif action == "start":
-            if s["status"] != "ready":
-                raise ValueError("설문을 먼저 완료하세요.")
+            if s["status"] != "consented":
+                raise ValueError("참가자 동의를 먼저 받아 주세요 (태블릿).")
             if store.active and store.active != sid:
                 raise ValueError("다른 참가자의 측정이 진행 중입니다.")
             if not s["demo"]:
                 if not config.get("schoolApprovalConfirmed"):
-                    raise ValueError("학교 승인과 필요한 보호자 동의를 확인한 후 config.json에서 schoolApprovalConfirmed를 설정하세요.")
+                    raise ValueError("학교 승인·보호자 동의 확인 후 config.json 의 schoolApprovalConfirmed 를 true 로 바꾸세요.")
                 if not collector.status()["connected"]:
-                    raise ValueError("Pico 신호가 수신되지 않습니다. Thonny 종료, 포트, 배선을 확인하세요.")
-            s.update(status="measuring", startedAt=now())
+                    raise ValueError("Pico 신호가 없습니다. Thonny 종료, 포트, 배선을 확인하세요.")
             store.start_ns = time.monotonic_ns()
             store.active = sid
-            store.event(sid, "measurement_start")
+            store.pulses = []
+            s.update(status="running", startedAt=now(), step=0, stepStartedMs=0)
+            store.event(sid, "measurement_start", 0)
+            store.event(sid, "step_start", 0, {"index": 0, **{k: script[0].get(k) for k in ("id", "kind", "category", "direction") if script[0].get(k)}})
+        elif action == "step":
+            if s["status"] != "running" or store.active != sid:
+                raise ValueError("진행 중인 세션이 아닙니다.")
+            index = b.get("index")
+            if type(index) is not int or not 0 <= index < len(script):
+                raise ValueError("단계 번호를 확인하세요.")
+            st = script[index]
+            host = store.event(sid, "step_start", None, {"index": index, **{k: st.get(k) for k in ("id", "kind", "category", "direction") if st.get(k)}})
+            s.update(step=index, stepStartedMs=js_round(host or 0))
+            if s["demo"]:
+                cat = st.get("category") or ("gaze_" + st["direction"] if st["kind"] == "gaze" else st["kind"])
+                if cat in DEMO_PULSE and st["kind"] != "question" and st["kind"] != "interview":
+                    store.pulses.append(((host or 0) / 1000, DEMO_PULSE[cat]))
+        elif action == "mark":
+            if s["status"] != "running" or store.active != sid:
+                raise ValueError("진행 중인 세션이 아닙니다.")
+            kind, qid = b.get("kind"), b.get("questionId")
+            if kind not in ("asked_end", "answer_start", "answer_end") or not isinstance(qid, str):
+                raise ValueError("표시 종류를 확인하세요.")
+            host = store.event(sid, "mark", None, {"questionId": qid, "kind": kind})
+            s["marks"].setdefault(qid, {})[kind] = js_round(host or 0)
+            if s["demo"] and kind == "asked_end":
+                st = next((x for x in script if x["id"] == qid), None)
+                if st and st.get("category") in DEMO_PULSE:
+                    store.pulses.append(((host or 0) / 1000, DEMO_PULSE[st["category"]]))
+        elif action == "answer":
+            if s["status"] != "running" or store.active != sid:
+                raise ValueError("진행 중인 세션이 아닙니다.")
+            item_id, value = b.get("itemId"), b.get("value")
+            if item_id not in {i["id"] for i in BIG5_ITEMS} or type(value) is not int or not 1 <= value <= 5:
+                raise ValueError("응답 값을 확인하세요.")
+            host = store.event(sid, "answer", None, {"itemId": item_id, "value": value, "source": b.get("source") if b.get("source") in ("tablet", "operator") else "unknown"})
+            s["answers"][item_id] = value
+            if script[s["step"]]["id"] == item_id and s.get("stepStartedMs") is not None and item_id not in s["answerLatency"]:
+                s["answerLatency"][item_id] = js_round((host or 0) - s["stepStartedMs"])
+        elif action == "note":
+            if s["status"] != "running":
+                raise ValueError("진행 중인 세션이 아닙니다.")
+            qid, text = b.get("questionId"), b.get("text")
+            if not isinstance(qid, str) or not isinstance(text, str) or len(text) > 1000:
+                raise ValueError("메모 형식을 확인하세요.")
+            s["notes"][qid] = text
         elif action == "complete":
             if s["status"] == "completed":
                 return jsonify(public_session(s))
-            if s["status"] != "measuring" or store.active != sid:
-                raise ValueError("측정 중인 세션이 아닙니다.")
-            total = sum(t for _, t in stages(s["course"], s["demo"]))
-            elapsed = (time.monotonic_ns() - store.start_ns) / 1e9
-            if elapsed < total - .5:
-                raise ValueError("측정이 아직 끝나지 않았어요.")
-            samples = store.raw(sid)
-            if not samples:
-                raise ValueError("기록된 센서 데이터가 없습니다. 측정을 중단하고 연결을 확인하세요.")
-            if not s["demo"] and not collector.status()["connected"]:
-                raise ValueError("센서 연결이 끊어졌습니다. 중단하면 부분 원시 데이터가 보존됩니다.")
-            rts, hardware_rts = [], []
-            stimulus_host = None
-            for e in store.event_rows(sid):
-                if e["type"] == "reaction":
-                    val = json.loads(e["payload"]).get("reactionMs")
-                    if isinstance(val, (int, float)) and 0 <= val <= 10000:
-                        rts.append(val)
-                elif e["type"] == "stimulus" and e.get("hostElapsedMs"):
-                    stimulus_host = float(e["hostElapsedMs"])
-                elif e["type"] == "hardware_button" and stimulus_host is not None and e.get("hostElapsedMs"):
-                    delta = float(e["hostElapsedMs"]) - stimulus_host
-                    if 0 <= delta <= (2000 if s["demo"] else 6000):
-                        hardware_rts.append(delta)
-                        stimulus_host = None
-            reaction_clock = "browser_performance" if rts else "host_receipt_approx" if hardware_rts else "not_available"
-            chosen_rts = rts or hardware_rts
-            metrics = analyze(samples, 6000 if s["demo"] else 60000, round(sum(chosen_rts) / len(chosen_rts)) if chosen_rts else None)
-            metrics["reactionClock"] = reaction_clock
-            metrics["hardwareReactionCount"] = len(hardware_rts)
-            metrics["observedHz"] = round(len(samples) / elapsed, 2)
-            metrics["missingSequenceCount"] = sum(max(0, int(b["seq"] - a["seq"] - 1)) for a, b in zip(samples, samples[1:]))
-            s.update(metrics=metrics, status="completed", completedAt=now(), report=rule_report(s["scores"], metrics))
-            store.event(sid, "measurement_end", elapsed * 1000, {"observedHz": metrics["observedHz"], "synthetic": s["demo"]})
-            store.active = None
+            if s["status"] != "running" or store.active != sid:
+                raise ValueError("진행 중인 세션이 아닙니다.")
+            finish(sid, s)
         elif action == "stop":
             if s["status"] in ("completed", "stopped"):
                 raise ValueError("이미 종료된 세션입니다.")
-            store.event(sid, "participant_stop", (time.monotonic_ns() - store.start_ns) / 1e6 if store.active == sid else 0)
+            store.event(sid, "participant_stop", None, {"from": "tablet" if request.remote_addr not in ("127.0.0.1", "::1") else "operator"})
             s["status"] = "stopped"
             if store.active == sid:
                 store.active = None
+                store.pulses = []
+        elif action == "feedback":
+            if s["status"] != "completed":
+                raise ValueError("완료된 세션만 평가할 수 있어요.")
+            acc, res = b.get("accuracy"), b.get("resonant")
+            if type(acc) is not int or not 1 <= acc <= 5 or (res is not None and (not isinstance(res, str) or len(res) > 300)):
+                raise ValueError("평가 값을 확인하세요.")
+            s["feedback"] = {"accuracy": acc, "resonant": res, "reportSource": (s.get("report") or {}).get("source"), "at": now()}
+            store.event(sid, "feedback", 0, s["feedback"])
         else:
             raise ValueError("지원하지 않는 동작입니다.")
         store.save(s)
@@ -286,27 +344,32 @@ def session_route(sid):
 
 @app.post("/api/sessions/<sid>/events")
 def events(sid):
-    s = store.get(sid)
+    """브라우저 측 보조 이벤트(가시성 변화 등). 자극/응답 시각은 서버 시계 기준 mark/answer 를 쓴다."""
+    store.get(sid)
     b = request.get_json()
-    if not isinstance(b.get("type"), str) or len(b["type"]) > 80 or not isinstance(b.get("elapsedMs"), (int, float)) or not 0 <= b["elapsedMs"] <= 3600000:
+    if not isinstance(b.get("type"), str) or len(b["type"]) > 80:
         raise ValueError("이벤트 형식을 확인하세요.")
-    store.event(sid, b["type"], b["elapsedMs"], b.get("payload", {}))
+    store.event(sid, "client_" + b["type"], None, b.get("payload", {}))
     return jsonify(ok=True)
 
 
 @app.post("/api/sessions/<sid>/report")
 def report(sid):
+    denied = operator()
+    if denied:
+        return denied
     s = store.get(sid)
     if s["status"] != "completed":
         raise ValueError("검사를 먼저 완료하세요.")
-    if time.time() - s.get("_lastReport", 0) < 15:
-        return jsonify(report=s["report"], reportSource=s["reportSource"])
+    if time.time() - s.get("_lastReport", 0) < 10:
+        return jsonify(report=s["report"], reportPending=False)
     result = generate_report(s)
     with store.lock:
         s = store.get(sid)
-        s.update(result, _lastReport=time.time())
+        s.update(report=result, reportPending=False, _lastReport=time.time())
         store.save(s)
-    return jsonify(result)
+        store.event(sid, "report_generated", 0, {"source": result["source"], "model": result.get("model"), "promptVersion": result.get("promptVersion"), "error": result.get("error")})
+    return jsonify(report=result, reportPending=False)
 
 
 @app.post("/api/sessions/<sid>/print")
@@ -325,20 +388,22 @@ def print_session(sid):
     width = str(request.get_json().get("paperWidth", config["paperWidth"]))
     if width not in ("58", "80"):
         raise ValueError("인쇄 용지 너비를 확인하세요.")
-    result = send_receipt(s, {**config, "paperWidth": width}, f"http://{lan_ip()}:{config['port']}/result/{sid}", store.folder(sid))
-    store.event(sid, "print_requested", payload={"mode": config["printer"], "browser": result["browser"]})
+    result = send_receipt(s, {**config, "paperWidth": width}, f"{base_url()}/result/{sid}", store.folder(sid))
+    store.event(sid, "print_requested", 0, {"mode": config["printer"], "browser": result["browser"]})
     return jsonify(result)
 
 
 @app.get("/api/export")
 def export():
+    """CSV 는 UTF-8 BOM 포함 → 엑셀에서 더블클릭으로 바로 열림."""
     denied = operator()
     if denied:
         return denied
     sid, kind = request.args.get("id"), request.args.get("kind", "sessions")
     selected = [store.get(sid)] if sid else store.all()
     if request.args.get("format") == "json":
-        payload = {"project": "oriori_gsr", "protocol": PROTOCOL, "instrument": INSTRUMENT, "adcUnit": "uncalibrated_u16", "researchApproved": False, "exportedAt": now(), "sessions": [public_session(s) for s in selected], "raw": [{"sessionId": s["id"], "samples": store.raw(s["id"])} for s in selected], "events": [{"sessionId": s["id"], "events": store.event_rows(s["id"])} for s in selected]}
+        payload = {"project": "oriori_gsr", "protocol": PROTOCOL, "instrument": INSTRUMENT, "adcUnit": "uncalibrated_u16", "researchApproved": False, "exportedAt": now(),
+                   "sessions": [public_session(s) for s in selected], "raw": [{"sessionId": s["id"], "samples": store.raw(s["id"])} for s in selected], "events": [{"sessionId": s["id"], "events": store.event_rows(s["id"])} for s in selected]}
         return Response(json.dumps(payload, ensure_ascii=False, indent=2), mimetype="application/json", headers={"Content-Disposition": "attachment; filename=oriori_gsr_dataset.json"})
     output = io.StringIO(newline="")
     output.write("\ufeff")
@@ -354,13 +419,27 @@ def export():
         for s in selected:
             for row in store.event_rows(s["id"]):
                 writer.writerow({"session_id": s["id"], **row})
+    elif kind == "responses":
+        writer = csv.DictWriter(output, RESPONSE_FIELDS)
+        writer.writeheader()
+        for s in selected:
+            for r in s.get("responses") or []:
+                writer.writerow({"session_id": s["id"], "course": s["course"], "synthetic": s["demo"], "event_id": r["eventId"], "category": r["category"], "onset_ms": r["onsetMs"], "pre_mean_adc": r["preMean"],
+                                 "amplitude_adc": r["amplitude"], "z_baseline": r["z"], "latency_ms": r["latencyMs"], "answer": r["answer"], "note": r["note"]})
     else:
         writer = csv.writer(output)
-        writer.writerow(["id", "code", "course", "status", "demo", "created_at", *LABELS, "baseline_adc", "change_pct", "samples", "research_consent"])
+        item_cols = [i["id"] for i in BIG5_ITEMS]
+        writer.writerow(["id", "code", "course", "status", "demo", "created_at", "ai_consent", *LABELS, "reference_4letter", *item_cols, "baseline_adc", "baseline_sd", "quality_pct", "observed_hz",
+                         "gaze_direct_z", "gaze_averted_z", "q_neutral_z", "q_self_z", "q_social_z", "i_lack_z", "i_filled_z", "i_meaning_z", "question_latency_median_ms", "big5_latency_median_ms",
+                         "report_source", "report_model", "report_title", "feedback_accuracy", "feedback_resonant", "research_consent"])
         for s in selected:
-            scores, metrics = s.get("scores") or {}, s.get("metrics") or {}
-            writer.writerow([s["id"], s["code"], s["course"], s["status"], s["demo"], s["createdAt"], *[scores.get(k) for k in LABELS], metrics.get("baseline"), metrics.get("change"), metrics.get("samples"), False])
-    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=oriori_gsr_{kind if kind in ('raw', 'events') else 'sessions'}.csv"})
+            sc, m, cz, rep, fb = s.get("scores") or {}, s.get("metrics") or {}, (s.get("metrics") or {}).get("categoryZ") or {}, s.get("report") or {}, s.get("feedback") or {}
+            writer.writerow([s["id"], s["code"], s["course"], s["status"], s["demo"], s["createdAt"], s["aiConsent"], *[sc.get(k) for k in LABELS], reference_type(sc), *[(s.get("answers") or {}).get(c) for c in item_cols],
+                             m.get("baseline"), m.get("baselineSd"), m.get("quality"), m.get("observedHz"), cz.get("gaze_direct"), cz.get("gaze_averted"), cz.get("question_neutral"), cz.get("question_self"), cz.get("question_social"),
+                             cz.get("interview_lack"), cz.get("interview_filled"), cz.get("interview_meaning"), m.get("questionLatencyMedianMs"), m.get("big5LatencyMedianMs"),
+                             rep.get("source"), rep.get("model"), rep.get("title"), fb.get("accuracy"), fb.get("resonant"), False])
+    name = kind if kind in ("raw", "events", "responses") else "sessions"
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=oriori_gsr_{name}.csv"})
 
 
 @app.get("/downloads/README.md")
@@ -381,10 +460,7 @@ def package():
             if not p.is_file() or any(x in ("__pycache__", ".venv", "data") for x in rel.parts):
                 continue
             if str(rel) in allowed or rel.parts[0] in ("pico", "static", "assets"):
-                if str(rel) == "config.json":
-                    z.write(ROOT / "config.example.json", "oriori_gsr/config.json")
-                else:
-                    z.write(p, "oriori_gsr/" + str(rel))
+                z.write(ROOT / "config.example.json" if str(rel) == "config.json" else p, "oriori_gsr/" + str(rel))
     return Response(stream.getvalue(), mimetype="application/zip", headers={"Content-Disposition": "attachment; filename=oriori_gsr.zip"})
 
 
@@ -393,15 +469,17 @@ if __name__ == "__main__":
     store.recover_and_expire(int(config.get("retentionDays", 30)))
     collector.start()
     host = lan_ip()
-    port = int(config["port"])
-    print("\n=== oriori_gsr v1.0 ===", flush=True)
+    port = int(os.environ.get("ORIORI_PORT", config["port"]))
+    print("\n=== oriori_gsr v2.0 ===", flush=True)
     print(f"Operator: http://127.0.0.1:{port}", flush=True)
-    print(f"Tablet:   http://{host}:{port}/tablet", flush=True)
-    print(f"Mode: {config['mode']} | Data: {DATA}", flush=True)
-    print("Keep this window open. Press Ctrl+C to stop. Private hotspot only.\n", flush=True)
+    print(f"Tablet:   http://{host}:{port}/tablet   (같은 핫스팟, localhost 아님)", flush=True)
+    print(f"Mode: {config['mode']} | Claude: {'ON' if llm_ready() else 'OFF (.env 에 ANTHROPIC_API_KEY)'} | Data: {DATA}", flush=True)
+    if ALLOW_REMOTE_OPERATOR:
+        print("WARNING: ORIORI_ALLOW_REMOTE_OPERATOR=1 — 운영 API 가 네트워크에 열려 있습니다. 현장에서는 끄세요.", flush=True)
+    print("이 창을 닫지 마세요. Ctrl+C 로 종료.\n", flush=True)
     if not os.environ.get("ORIORI_NO_BROWSER"):
         threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     try:
-        serve(app, host="0.0.0.0", port=port, threads=8, max_request_body_size=128 * 1024)
+        serve(app, host="0.0.0.0", port=port, threads=8, max_request_body_size=256 * 1024)
     except KeyboardInterrupt:
         collector.running = False
