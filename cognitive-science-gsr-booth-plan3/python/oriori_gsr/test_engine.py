@@ -222,45 +222,105 @@ if __name__ == "__main__":
 
 
 class ClaudeParsingTests(unittest.TestCase):
-    """실제 API 호출 없이 응답 파싱·검증·폴백을 확인한다."""
+    """실제 API 호출 없이 요청 형식·응답 파싱·검증·폴백을 확인한다."""
     session = {"course": "deep", "aiConsent": True, "demo": True, "scores": {"O": 60, "C": 40, "E": 70, "A": 55, "N": 30},
                "metrics": {"categoryZ": {"gaze_direct": 2.0, "gaze_averted": 0.2}, "questionLatencyMedianMs": 900},
                "responses": [{"category": "interview_lack", "latencyMs": 2000, "z": 1.0, "note": "시간이 부족"}]}
+    GOOD = ('{"title": "조용한 항해사", "character": "오늘 당신은 \\"시간이 부족\\"하다고 말했어요. 눈이 마주칠 때 몸이 먼저 반응했어요. 고정된 모습은 아니에요.", '
+            '"lackMeaning": "부족함은 방향일지도 몰라요. 채워진 순간을 기억해 두세요.", "takeHome": "부족한 시간은 어디로 흘러가고 있나요?", "oneLine": "천천히, 당신의 속도로.", '
+            '"codes": {"lackDomain": ["time", "bogus", "rest", "money"], "filledContext": "creation", "meaningSource": [], "affectTone": "warm"}, "safetyFlag": false, "safetyNote": ""}')
 
-    def fake(self, text):
+    def fake(self, responses):
+        """responses: 순서대로 반환할 (status, body_text). status 200 이면 정상, 아니면 HTTPError."""
         import io
-        class R(io.BytesIO):
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-        body = json.dumps({"model": "claude-test", "content": [{"type": "text", "text": text}]}).encode()
-        captured = {}
+        import urllib.error
+        calls = []
+        queue = list(responses)
         def urlopen(req, timeout=0):
-            captured["headers"] = dict(req.header_items()); captured["body"] = json.loads(req.data)
-            return R(body)
-        return urlopen, captured
+            calls.append({"url": req.full_url, "headers": dict(req.header_items()), "body": json.loads(req.data) if req.data else None})
+            status, text = queue.pop(0)
+            if status != 200:
+                raise urllib.error.HTTPError(req.full_url, status, "err", {}, io.BytesIO(text.encode()))
+            return io.BytesIO(text.encode())
+        return urlopen, calls
 
-    def test_valid_json_is_accepted(self):
+    def message(self, text, model="claude-sonnet-5"):
+        return json.dumps({"model": model, "content": [{"type": "text", "text": text}], "usage": {"input_tokens": 10, "output_tokens": 20}})
+
+    def test_request_shape_sonnet5_thinking_off(self):
         os.environ["ANTHROPIC_API_KEY"] = "sk-test"
-        urlopen, cap = self.fake('설명: {"title": "조용한 항해사", "character": "오늘 당신은 시간이 부족하다고 말했어요. 눈이 마주칠 때 몸이 먼저 반응했어요. 고정된 모습은 아니에요.", "lackMeaning": "부족함은 방향일지도 몰라요. 채워진 순간을 기억해 두세요.", "oneLine": "천천히, 당신의 속도로."}')
+        os.environ.pop("ANTHROPIC_MODEL", None)
+        urlopen, calls = self.fake([(200, self.message(self.GOOD))])
+        with unittest.mock.patch.object(engine.urllib.request, "urlopen", urlopen):
+            r = engine.generate_report(self.session)
+        body = calls[0]["body"]
+        self.assertEqual(body["model"], "claude-sonnet-5")
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+        for forbidden in ("temperature", "top_p", "top_k"):
+            self.assertNotIn(forbidden, body)
+        self.assertEqual(calls[0]["headers"].get("X-api-key"), "sk-test")
+        self.assertIn("anthropic-version", {k.lower() for k in calls[0]["headers"]})
+        sent = json.loads(body["messages"][0]["content"])
+        self.assertEqual(sent["operator_notes_of_participant_answers"], {"결핍 질문": "시간이 부족"})
+        self.assertEqual(sent["skin_conductance_by_situation"]["눈맞춤 (직접 시선)"], "뚜렷하게 올라감")
+        # 결과
+        self.assertEqual(r["source"], "claude")
+        self.assertEqual(r["title"], "조용한 항해사")
+        self.assertEqual(r["takeHome"], "부족한 시간은 어디로 흘러가고 있나요?")
+        self.assertEqual(r["codes"]["lackDomain"], ["time", "rest"])          # 코드북 밖 값 제거, 최대 2개
+        self.assertEqual(r["codes"]["filledContext"], ["creation"])           # 문자열도 허용
+        self.assertEqual(r["codes"]["meaningSource"], ["none"])               # 빈 배열 → none
+        self.assertEqual(r["codes"]["affectTone"], "warm")
+        self.assertFalse(r["safetyFlag"]); self.assertFalse(r["held"])
+        self.assertEqual(r["thinking"], "disabled"); self.assertEqual(r["promptVersion"], "deep-character-v2")
+        os.environ.pop("ANTHROPIC_API_KEY")
+
+    def test_safety_flag_holds_report(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        text = self.GOOD.replace('"safetyFlag": false, "safetyNote": ""', '"safetyFlag": true, "safetyNote": "자해 언급 가능성"')
+        urlopen, _ = self.fake([(200, self.message(text))])
+        with unittest.mock.patch.object(engine.urllib.request, "urlopen", urlopen):
+            r = engine.generate_report(self.session)
+        self.assertTrue(r["safetyFlag"]); self.assertTrue(r["held"]); self.assertEqual(r["safetyNote"], "자해 언급 가능성")
+        os.environ.pop("ANTHROPIC_API_KEY")
+
+    def test_model_not_found_falls_back_to_latest_sonnet(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-9"
+        engine._model_cache.clear()
+        models = json.dumps({"data": [{"id": "claude-opus-6"}, {"id": "claude-sonnet-5-20260101"}, {"id": "claude-haiku-4-5"}]})
+        urlopen, calls = self.fake([(404, '{"error":{"type":"not_found_error","message":"model: claude-sonnet-9"}}'), (200, models), (200, self.message(self.GOOD, "claude-sonnet-5-20260101"))])
         with unittest.mock.patch.object(engine.urllib.request, "urlopen", urlopen):
             r = engine.generate_report(self.session)
         self.assertEqual(r["source"], "claude")
-        self.assertEqual(r["title"], "조용한 항해사")
-        self.assertEqual(cap["headers"].get("X-api-key"), "sk-test")
-        self.assertIn("anthropic-version", {k.lower() for k in cap["headers"]})
-        sent = json.loads(cap["body"]["messages"][0]["content"])
-        self.assertEqual(sent["operator_notes_of_participant_answers"], {"결핍 질문": "시간이 부족"})
-        self.assertEqual(sent["skin_conductance_by_situation"]["눈맞춤 (직접 시선)"], "뚜렷하게 올라감")
+        self.assertEqual(calls[1]["url"], "https://api.anthropic.com/v1/models?limit=100")
+        self.assertEqual(calls[2]["body"]["model"], "claude-sonnet-5-20260101")
+        self.assertEqual(r["notes"], ["model claude-sonnet-9 not found → claude-sonnet-5-20260101"])
+        self.assertEqual(engine._model_cache["claude-sonnet-9"], "claude-sonnet-5-20260101")
+        engine._model_cache.clear()
+        os.environ.pop("ANTHROPIC_MODEL"); os.environ.pop("ANTHROPIC_API_KEY")
+
+    def test_thinking_rejected_retries_without_field(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        urlopen, calls = self.fake([(400, '{"error":{"message":"thinking.type.disabled is not supported for this model."}}'), (200, self.message(self.GOOD))])
+        with unittest.mock.patch.object(engine.urllib.request, "urlopen", urlopen):
+            r = engine.generate_report(self.session)
+        self.assertEqual(r["source"], "claude")
+        self.assertNotIn("thinking", calls[1]["body"])
         os.environ.pop("ANTHROPIC_API_KEY")
 
     def test_digits_or_bad_shape_fall_back(self):
         os.environ["ANTHROPIC_API_KEY"] = "sk-test"
-        for text in ('{"title": "x", "character": "당신은 87점이에요", "lackMeaning": "y", "oneLine": "z"}', 'not json', '{"title": "x"}'):
-            urlopen, _ = self.fake(text)
+        for text in (self.GOOD.replace("조용한 항해사", "87점 항해사"), "not json", '{"title": "x"}', '{"error":{"message":"overloaded"}}'):
+            urlopen, _ = self.fake([(200, self.message(text))])
             with unittest.mock.patch.object(engine.urllib.request, "urlopen", urlopen):
                 r = engine.generate_report(self.session)
             self.assertEqual(r["source"], "rules-fallback")
             self.assertIn("error", r)
+            self.assertEqual(r["takeHome"], engine.RULE_TAKE_HOME)
+        urlopen, _ = self.fake([(500, "server error")])
+        with unittest.mock.patch.object(engine.urllib.request, "urlopen", urlopen):
+            self.assertEqual(engine.generate_report(self.session)["source"], "rules-fallback")
         os.environ.pop("ANTHROPIC_API_KEY")
 
     def test_not_sent_without_consent_or_for_other_courses(self):
@@ -271,3 +331,52 @@ class ClaudeParsingTests(unittest.TestCase):
             self.assertEqual(engine.generate_report({**self.session, "course": "social"})["source"], "rules")
         self.assertEqual(calls, [])
         os.environ.pop("ANTHROPIC_API_KEY")
+
+
+class ReportReviewTests(unittest.TestCase):
+    """운영자 수정·안전 보류·공개 흐름 (API)."""
+    def setUp(self):
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.remote = {"REMOTE_ADDR": "192.168.1.20"}
+        r = self.client.post("/api/sessions", json={"course": "deep"})
+        self.sid = r.json["id"]
+        s = store.get(self.sid)
+        s.update(status="completed", report={**engine.rule_report(s), "safetyFlag": True, "safetyNote": "테스트", "held": True, "source": "claude"})
+        store.save(s)
+
+    def tearDown(self):
+        store.active = None
+        if store.folder(self.sid).exists():
+            store.delete(self.sid)
+
+    def test_held_report_hidden_from_tablet_until_release(self):
+        path = f"/api/sessions/{self.sid}"
+        tablet = self.client.get(path, environ_overrides=self.remote).json
+        self.assertIsNone(tablet["report"]); self.assertTrue(tablet["reportHeld"])
+        self.assertIsNotNone(self.client.get(path).json["report"])          # 운영자는 봄
+        self.assertTrue(self.client.get(path + "?view=tablet").json["reportHeld"])  # 운영 PC 에서 연 태블릿 화면도 보류
+        self.assertEqual(self.client.patch(path, json={"action": "feedback", "accuracy": 3}, environ_overrides=self.remote).status_code, 400)
+        self.assertEqual(self.client.patch(path, json={"action": "release_report"}, environ_overrides=self.remote).status_code, 403)
+        r = self.client.patch(path, json={"action": "release_report"})
+        self.assertFalse(r.json["report"]["held"]); self.assertTrue(r.json["report"]["reviewedByOperator"])
+        tablet = self.client.get(path, environ_overrides=self.remote).json
+        self.assertIsNotNone(tablet["report"]); self.assertFalse(tablet.get("reportHeld"))
+        self.assertEqual(self.client.patch(path, json={"action": "feedback", "accuracy": 3}, environ_overrides=self.remote).status_code, 200)
+
+    def test_operator_edit_keeps_original(self):
+        path = f"/api/sessions/{self.sid}"
+        original = store.get(self.sid)["report"]["character"]
+        r = self.client.patch(path, json={"action": "edit_report", "character": "수정된 본문입니다.", "title": "  새 이름 ", "takeHome": ""})
+        self.assertEqual(r.status_code, 200, r.json)
+        rep = r.json["report"]
+        self.assertEqual(rep["character"], "수정된 본문입니다."); self.assertEqual(rep["title"], "새 이름"); self.assertIsNone(rep["takeHome"])
+        self.assertEqual(rep["original"]["character"], original); self.assertTrue(rep["editedByOperator"])
+        self.assertEqual(self.client.patch(path, json={"action": "edit_report", "character": ""}).status_code, 400)
+        self.assertEqual(self.client.patch(path, json={"action": "edit_report", "character": "x"}, environ_overrides=self.remote).status_code, 403)
+        csv_text = self.client.get(f"/api/export?kind=sessions&id={self.sid}").get_data(as_text=True)
+        self.assertIn("edited_by_operator", csv_text); self.assertIn("code_lack", csv_text)
+
+
+if __name__ == "__main__":
+    unittest.main()

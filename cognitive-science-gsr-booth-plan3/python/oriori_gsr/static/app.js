@@ -71,8 +71,16 @@
   function reportHtml(s, forTablet) {
     const r = s.report || {};
     if (s.reportPending) return `<div class="report"><p class="muted">Claude 가 오늘의 기록을 문장으로 옮기고 있어요… (운영 화면에서 생성 중)</p></div>`;
-    return `<div class="report">${r.title ? `<div class="title">${esc(r.title)}</div>` : ''}<p>${esc(r.character)}</p>${r.lackMeaning ? `<p>${esc(r.lackMeaning)}</p>` : ''}${r.oneLine ? `<p class="one">“${esc(r.oneLine)}”</p>` : ''}
-      ${forTablet ? '' : `<p class="tiny muted">출처: ${r.source === 'claude' ? 'Claude · ' + esc(r.model) : r.source === 'rules-fallback' ? '규칙 문장 (Claude 실패: ' + esc(r.error || '') + ')' : '규칙 문장'}</p>`}</div>`;
+    if (s.reportHeld || !s.report) return `<div class="report"><p class="muted">운영자가 결과 문장을 확인한 뒤 함께 보여드릴게요.</p></div>`;
+    return `<div class="report">${r.title ? `<div class="title">${esc(r.title)}</div>` : ''}<p>${esc(r.character)}</p>${r.lackMeaning ? `<p>${esc(r.lackMeaning)}</p>` : ''}
+      ${r.takeHome ? `<p class="take"><span class="tiny muted">집에 가져갈 질문</span><br><b>${esc(r.takeHome)}</b></p>` : ''}${r.oneLine ? `<p class="one">“${esc(r.oneLine)}”</p>` : ''}
+      ${forTablet ? '' : `<p class="tiny muted">출처: ${r.source === 'claude' ? 'Claude · ' + esc(r.model) + ' · thinking 끔 · ' + esc(r.promptVersion || '') : r.source === 'rules-fallback' ? '규칙 문장 (Claude 실패: ' + esc(r.error || '') + ')' : '규칙 문장'}${r.editedByOperator ? ' · 운영자 수정됨' : ''}${r.notes ? ' · ' + esc(r.notes.join('; ')) : ''}</p>`}</div>`;
+  }
+  function codesHtml(codes, book) {
+    if (!codes || !book) return '';
+    const label = (k, v) => book[k]?.[v] || v;
+    const tone = { warm: '따뜻함', neutral: '중립', heavy: '무거움' }[codes.affectTone] || codes.affectTone;
+    return `<div class="chips"><span class="tiny muted">Claude 코딩 (코드북 v2)</span> ${['lackDomain', 'filledContext', 'meaningSource'].map(k => `<span class="chip"><b>${{ lackDomain: '결핍', filledContext: '충만', meaningSource: '의미' }[k]}</b> ${(codes[k] || []).map(v => esc(label(k, v))).join(', ')}</span>`).join('')}<span class="chip">톤 ${esc(tone)}</span></div>`;
   }
 
   // ======================================================================= 운영자
@@ -275,7 +283,9 @@
           <table><thead><tr><th>상황</th><th>z</th><th>말로</th></tr></thead><tbody>${Object.keys(CAT).filter(k => cz[k] != null).map(k => `<tr><td>${CAT[k]}</td><td class="mono">${cz[k]}</td><td>${word(cz[k])}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">이벤트 없음</td></tr>'}</tbody></table>
           <div class="small muted" style="margin-top:8px">대비: ${Object.entries(m.contrasts || {}).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}<br>기준선 ${m.baseline} ± ${m.baselineSd} · 품질 ${m.quality}% · ${m.observedHz} Hz · 누락 seq ${m.missingSequenceCount} · 극성 ${m.polarity}</div></div></div>
         <div class="grid2" style="margin-top:14px"><div class="card"><h2>질문별 반응시간 · 메모</h2><table><thead><tr><th>질문</th><th>뜸(ms)</th><th>z</th><th>메모</th></tr></thead><tbody>${(s.responses || []).filter(r => !r.category.startsWith('big5')).map(r => `<tr><td>${CAT[r.category] || r.category}</td><td class="mono">${r.latencyMs ?? '—'}</td><td class="mono">${r.z ?? '—'}</td><td class="small">${esc(r.note || '')}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">기본 코스에는 질문 과제가 없어요</td></tr>'}</tbody></table></div>
-        <div class="card"><div class="row between"><h2>결과 문장</h2>${canClaude ? `<button class="btn primary" id="gen">${s.report?.source === 'claude' ? 'Claude 로 다시 생성' : 'Claude 로 서사 생성'}</button>` : ''}</div><div id="rep">${reportHtml(s)}</div>
+        <div class="card"><div class="row between"><h2>결과 문장</h2><div class="row">${s.report ? '<button class="btn" id="edit">문장 수정</button>' : ''}${canClaude ? `<button class="btn primary" id="gen">${s.report?.source === 'claude' ? 'Claude 로 다시 생성' : 'Claude 로 서사 생성'}</button>` : ''}</div></div>
+          <div id="safety">${s.report?.safetyFlag ? `<div class="alert"><b>운영자 확인 필요</b> — Claude 가 메모에서 위기 신호 가능성을 표시했어요: “${esc(s.report.safetyNote || '')}”. 문장은 담백하게 작성되었고 ${s.report.held ? '<b>태블릿에는 아직 보이지 않습니다.</b> 내용을 읽고 필요하면 수정한 뒤 공개하세요. 참가자가 힘들어 보이면 담당 선생님/상담 선생님께 연결하는 것을 우선하세요.' : '운영자가 공개했습니다.'}${s.report.held ? '<div style="margin-top:8px"><button class="btn green" id="release">확인했어요 · 태블릿에 공개</button></div>' : ''}</div>` : ''}</div>
+          <div id="rep">${reportHtml(s)}</div><div id="editbox"></div>${codesHtml(s.report?.codes, ws.codebook)}
           ${s.feedback ? `<div class="small" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">참가자 평가 <b>${s.feedback.accuracy}/5</b>${s.feedback.resonant ? ` · 와닿은 문장: “${esc(s.feedback.resonant)}”` : ''}</div>` : '<div class="tiny muted" style="margin-top:10px">참가자 평가는 태블릿 결과 화면에서 입력됩니다.</div>'}
           ${!canClaude && s.course === 'deep' ? `<div class="tiny muted" style="margin-top:8px">${!s.aiConsent ? '참가자가 Claude 전송에 동의하지 않아 규칙 문장을 사용합니다.' : !ws.llmAvailable ? '.env 에 ANTHROPIC_API_KEY 가 없어 규칙 문장을 사용합니다.' : ''}</div>` : ''}</div></div>
         <div class="card" style="margin-top:14px"><div class="row" style="gap:8px"><b class="small">이 세션 내보내기</b><a class="btn small" href="/api/export?kind=sessions&id=${sid}">요약 CSV</a><a class="btn small" href="/api/export?kind=responses&id=${sid}">이벤트별 반응 CSV</a><a class="btn small" href="/api/export?kind=raw&id=${sid}">원시 신호 CSV</a><a class="btn small" href="/api/export?kind=events&id=${sid}">이벤트 CSV</a><a class="btn small" href="/api/export?format=json&id=${sid}">전체 JSON</a></div></div>`}`,
@@ -283,6 +293,17 @@
       const gen = async () => { const b = $('#gen'); if (b) { b.disabled = true; b.textContent = 'Claude 생성 중…'; } try { const r = await api(`/api/sessions/${sid}/report`, 'POST', {}); s.report = r.report; s.reportPending = false; $('#rep').innerHTML = reportHtml(s); toast(r.report.source === 'claude' ? 'Claude 서사를 생성했어요. 내용을 확인하고 인쇄하세요.' : '규칙 문장으로 대체했어요: ' + (r.report.error || ''), r.report.source !== 'claude'); } catch (e) { toast(e.message, true); } finally { if (b) { b.disabled = false; b.textContent = 'Claude 로 다시 생성'; } } };
       const g = $('#gen'); if (g) g.onclick = gen;
       if (s.reportPending && canClaude) gen();
+      const rel = $('#release'); if (rel) rel.onclick = async () => { try { s = await patch(sid, { action: 'release_report' }); toast('태블릿에 공개했어요.'); result(); } catch (e) { toast(e.message, true); } };
+      const ed = $('#edit'); if (ed) ed.onclick = () => {
+        const r = s.report || {}, box = $('#editbox');
+        if (box.innerHTML) { box.innerHTML = ''; return; }
+        box.innerHTML = `<div class="card" style="margin-top:12px;box-shadow:none"><h3>문장 수정 <span class="tiny muted">원문은 original 에 보존됩니다. 숫자·진단·유형 확정은 넣지 마세요.</span></h3>
+          <label class="field">캐릭터 이름</label><input type="text" id="e_title" value="${esc(r.title || '')}"><label class="field">오늘의 나</label><textarea id="e_character">${esc(r.character || '')}</textarea>
+          <label class="field">결핍과 의미</label><textarea id="e_lack">${esc(r.lackMeaning || '')}</textarea><label class="field">집에 가져갈 질문</label><input type="text" id="e_take" value="${esc(r.takeHome || '')}"><label class="field">한 줄</label><input type="text" id="e_one" value="${esc(r.oneLine || '')}">
+          <div class="controls"><button class="btn primary" id="e_save">저장</button><button class="btn ghost" id="e_cancel">취소</button></div></div>`;
+        $('#e_cancel').onclick = () => { box.innerHTML = ''; };
+        $('#e_save').onclick = async () => { try { s = await patch(sid, { action: 'edit_report', title: $('#e_title').value, character: $('#e_character').value, lackMeaning: $('#e_lack').value, takeHome: $('#e_take').value, oneLine: $('#e_one').value }); toast('수정했어요.'); result(); } catch (e) { toast(e.message, true); } };
+      };
       const p = $('#print'); if (p) p.onclick = async () => { try { const r = await api(`/api/sessions/${sid}/print`, 'POST', { paperWidth: ws.settings.paperWidth }); toast(r.browser ? '브라우저 인쇄 모드입니다. 영수증 열기를 사용하세요.' : '프린터로 전송했어요.'); } catch (e) { toast(e.message, true); } };
       $('#del').onclick = async () => { if (!confirm(`${s.code} 의 응답·원시 신호·이벤트를 영구 삭제할까요?`)) return; try { await api(`/api/sessions/${sid}`, 'DELETE'); toast('삭제했어요.'); location.hash = 'dash'; } catch (e) { toast(e.message, true); } };
       state.timers.push(setInterval(async () => { try { const n = await api(`/api/sessions/${sid}`); if (JSON.stringify(n.feedback) !== JSON.stringify(s.feedback)) { s = n; result(); } } catch { /* ignore */ } }, 4000));
@@ -334,7 +355,8 @@
         <div class="small muted">학교 승인 확인: <b>${st.schoolApprovalConfirmed ? '완료' : '미완료 (config.json 의 schoolApprovalConfirmed)'}</b></div></div>
         <div class="card"><h2>영수증 프린터</h2><label class="field">출력 방식</label><select id="printer">${[['browser', '브라우저 인쇄 / PDF (기본)'], ['win32', 'Windows RAW ESC/POS'], ['usb', 'USB ESC/POS (VID/PID 는 config.json)'], ['network', '네트워크 ESC/POS (printerHost)']].map(([v, n]) => `<option value="${v}" ${st.printer === v ? 'selected' : ''}>${n}</option>`).join('')}</select>
         <label class="field">감열지 너비</label><select id="paper"><option value="80" ${st.paperWidth == 80 ? 'selected' : ''}>80mm</option><option value="58" ${st.paperWidth == 58 ? 'selected' : ''}>58mm</option></select>
-        <h3 style="margin-top:18px">Claude</h3><div class="small">${state.ws.llmAvailable ? `<span class="badge ok">ON</span> 모델 <span class="mono">${esc(state.ws.llmModel)}</span>` : '<span class="badge">OFF</span> .env 에 ANTHROPIC_API_KEY 를 넣고 재시작'}</div><div class="tiny muted" style="margin-top:6px">전송 내용: Big5 점수, 상황별 반응(말로 요약), 질문별 뜸, 운영자 메모. 이름·원음성·원시 신호는 전송하지 않음. 심층 코스 + 참가자 선택 동의 시에만.</div>
+        <h3 style="margin-top:18px">Claude</h3><div class="small">${state.ws.llmAvailable ? `<span class="badge ok">ON</span> 모델 <span class="mono">${esc(state.ws.llmModel)}</span> · thinking 끔` : '<span class="badge">OFF</span> .env 에 ANTHROPIC_API_KEY 를 넣고 재시작'}</div>
+        <div class="tiny muted" style="margin-top:6px">Claude 가 하는 일(심층 코스): ① 캐릭터 이름 + '오늘의 나' 서사 ② 결핍·의미 되비추기 ③ 집에 가져갈 질문 ④ 메모를 코드북(결핍 영역/충만 맥락/의미 원천/정서 톤)으로 코딩 → CSV 열 ⑤ 위기 신호 감지 시 운영자 확인 전까지 태블릿 비공개. 숫자·진단·유형 확정 문장은 코드가 거부하고 규칙 문장으로 대체.</div><div class="tiny muted" style="margin-top:6px">전송 내용: Big5 점수, 상황별 반응(말로 요약), 질문별 뜸, 운영자 메모. 이름·원음성·원시 신호는 전송하지 않음. 심층 코스 + 참가자 선택 동의 시에만.</div>
         <div class="controls"><button class="btn primary" id="save">설정 저장</button></div></div></div>`, '설정', '측정 중에는 저장이 막힙니다.');
       $('#port').onchange = e => { $('#portText').value = e.target.value; };
       $('#save').onclick = async () => { try { await api('/api/settings', 'PATCH', { serialPort: $('#portText').value.trim(), printer: $('#printer').value, paperWidth: $('#paper').value, adcRisesWithArousal: $('#pol').checked }); toast('저장했어요. 포트 변경은 앱 재시작 후 적용됩니다.'); await loadWs(); } catch (e) { toast(e.message, true); } };
@@ -351,14 +373,14 @@
     document.addEventListener('visibilitychange', () => { if (s && s.status === 'running') api(`/api/sessions/${sid}/events`, 'POST', { type: 'visibility', payload: { hidden: document.hidden } }).catch(() => {}); });
     async function poll() {
       try {
-        const n = await api(`/api/sessions/${sid}${script ? '' : '?script=1'}`);
+        const n = await api(`/api/sessions/${sid}?view=tablet${script ? '' : '&script=1'}`);
         if (n.script) script = n.script;
         s = n; draw();
       } catch (e) { card(`<h1>연결을 확인해 주세요</h1><p class="lead">${esc(e.message)}</p>`); }
     }
     function draw() {
       const st = script?.[s.step];
-      const key = JSON.stringify([s.status, s.step, s.answers?.[st?.id], s.reportPending, !!s.report, local]);
+      const key = JSON.stringify([s.status, s.step, s.answers?.[st?.id], s.reportPending, s.reportHeld, !!s.report, s.report?.editedByOperator, local]);
       if (key === lastKey) return; lastKey = key;
       if (s.status === 'waiting') {
         card(`<h1>시작하기 전에,<br>약속 몇 가지만 확인해요.</h1><p class="lead">이 체험은 당신을 어떤 유형에 가두는 검사가 아니에요.</p>
@@ -392,7 +414,7 @@
         card(`<h1>오늘의 나,<br>잘 만나고 왔나요?</h1>
           <div style="text-align:left;margin:18px 0">${reportHtml(s, true)}</div>
           <div style="text-align:left">${bars(s.scores)}<div class="tiny muted">0–100 은 응답 범위 환산값이에요 (인구 백분위 아님). 4글자 참고 표기 ${s.referenceType || '—'} 는 공식 MBTI 가 아니에요. 센서로 성격이나 감정을 판정하지 않아요.</div></div>
-          ${s.feedback || local.sent ? `<div class="thanks">고마워요. 오늘의 기록은 ${s.code} 로 남아요.</div><p class="small muted">삭제를 원하면 운영자에게 이 ID 를 말해 주세요.</p>` : s.reportPending ? '<p class="small muted" style="margin-top:16px">문장이 준비되면 평가를 부탁드릴게요.</p>' : `
+          ${s.feedback || local.sent ? `<div class="thanks">고마워요. 오늘의 기록은 ${s.code} 로 남아요.</div><p class="small muted">삭제를 원하면 운영자에게 이 ID 를 말해 주세요.</p>` : (s.reportPending || s.reportHeld || !s.report) ? '<p class="small muted" style="margin-top:16px">문장이 준비되면 평가를 부탁드릴게요.</p>' : `
           <hr style="border:0;border-top:1px solid var(--line);margin:22px 0"><div style="text-align:left"><b>이 문장들이 오늘의 나와 얼마나 맞나요?</b><div class="tscale" style="margin-top:10px">${['전혀', '조금', '보통', '꽤', '매우'].map((t, i) => `<button data-v="${i + 1}" class="${local.fb === i + 1 ? 'sel' : ''}">${i + 1}<small>${t}</small></button>`).join('')}</div>
           ${sentences.length ? `<div style="margin-top:16px"><b>가장 와닿는 문장 하나 (선택)</b><div class="pick">${sentences.map(x => `<button data-s="${esc(x)}" class="${local.resonant === x ? 'sel' : ''}">${esc(x)}</button>`).join('')}</div></div>` : ''}
           <div class="row" style="margin-top:16px;justify-content:flex-end"><button class="btn primary big" id="send" ${local.fb ? '' : 'disabled'}>보내기</button></div></div>`}`);
@@ -418,7 +440,7 @@
       ${r.title ? `<div class="c tiny" style="margin-top:8px">오늘의 나의 캐릭터</div><div class="c rt">${esc(r.title)}</div>` : ''}<hr>
       ${bars(s.scores)}<div class="c tiny">4글자 참고 ${s.referenceType || '—'} · 공식 MBTI 아님 · 0–100 은 응답 환산값</div><hr>
       ${Object.entries(sm.reactivity).map(([k, v]) => `<div>${esc(k)}: <b>${esc(v)}</b></div>`).join('')}${Object.entries(sm.latency).map(([k, v]) => `<div>${esc(k)}: ${esc(v)} 답함</div>`).join('')}
-      ${Object.keys(sm.reactivity).length ? '<hr>' : ''}<p>${esc(r.character || '')}</p>${r.lackMeaning ? `<p>${esc(r.lackMeaning)}</p>` : ''}${r.oneLine ? `<p class="c"><b>“${esc(r.oneLine)}”</b></p>` : ''}
+      ${Object.keys(sm.reactivity).length ? '<hr>' : ''}<p>${esc(r.character || '')}</p>${r.lackMeaning ? `<p>${esc(r.lackMeaning)}</p>` : ''}${r.takeHome ? `<p><span class="tiny">집에 가져갈 질문</span><br><b>${esc(r.takeHome)}</b></p>` : ''}${r.oneLine ? `<p class="c"><b>“${esc(r.oneLine)}”</b></p>` : ''}
       <hr><div class="c tiny">의료·성격 진단이 아닌 탐색용 기록<br>센서값으로 감정을 판독하지 않아요.</div>
       <img src="/api/qr?text=${encodeURIComponent(s.resultUrl)}&public=1" width="110" height="110" alt="QR"><div class="c tiny">YOU ARE MORE THAN A TYPE.</div></div></div>`;
   }

@@ -38,7 +38,9 @@ def run():
         session_rows.append({"session_id": s["id"], "course": s["course"], "synthetic": s["demo"], "created_at": s["createdAt"], **{f"big5_{k}": (s.get("scores") or {}).get(k) for k in LABELS},
                              **{f"z_{k}": cz.get(k) for k in CATEGORY_LABELS}, "gaze_contrast": metrics["contrasts"].get("gazeDirectMinusAverted"),
                              "question_latency_median_ms": metrics["questionLatencyMedianMs"], "baseline_adc": metrics["baseline"], "baseline_sd": metrics["baselineSd"], "quality_pct": metrics["quality"],
-                             "report_source": (s.get("report") or {}).get("source"), "feedback_accuracy": (s.get("feedback") or {}).get("accuracy"), "protocol": s.get("protocol")})
+                             "report_source": (s.get("report") or {}).get("source"), "feedback_accuracy": (s.get("feedback") or {}).get("accuracy"),
+                             **{f"code_{k}": "|".join(((s.get("report") or {}).get("codes") or {}).get(v) or []) for k, v in (("lack", "lackDomain"), ("filled", "filledContext"), ("meaning", "meaningSource"))},
+                             "affect_tone": ((s.get("report") or {}).get("codes") or {}).get("affectTone"), "safety_flag": (s.get("report") or {}).get("safetyFlag"), "protocol": s.get("protocol")})
         for r in responses:
             response_rows.append({"session_id": s["id"], "course": s["course"], "synthetic": s["demo"], **r})
     with open("analysis_sessions.csv", "w", newline="", encoding="utf-8-sig") as f:
@@ -60,6 +62,12 @@ def run():
     for src in sorted({x for x, _ in fb}):
         vals = [a for x, a in fb if x == src]
         print(f"  결과 문장 정확도 평가 [{src}] n={len(vals)} 평균 {statistics.mean(vals):.2f}")
+    coded = [r for r in session_rows if r.get("code_lack")]
+    if coded:
+        from collections import Counter
+        for k in ("code_lack", "code_filled", "code_meaning", "affect_tone"):
+            cnt = Counter(c for r in coded for c in str(r[k] or "").split("|") if c)
+            print(f"  Claude 코딩 {k} (n={len(coded)}): " + ", ".join(f"{a} {b}" for a, b in cnt.most_common(4)) + " — 1차 코딩. 사람 재코딩과 κ 산출 후 사용.")
     print("보정 전 ADC · 편의표본 · 탐색적. 인과/진단/성격 예측 주장 금지.")
 
 

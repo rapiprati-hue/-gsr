@@ -31,7 +31,7 @@
 - `mark` payload `{questionId, kind: asked_end|answer_start|answer_end}` — 운영자 Space.
 - `answer` payload `{itemId, value, source: tablet|operator}`.
 - `note` — 완료 시점에 인터뷰 메모를 로그로 남김.
-- `consent {ai_claude}`, `measurement_start/end`, `participant_stop {from}`, `feedback`, `report_generated {source, model, promptVersion, error}`, `print_requested`, `interrupted_restart`, `hardware_button`, `device_clock_reset`, `client_visibility`.
+- `consent {ai_claude}`, `measurement_start/end`, `participant_stop {from}`, `feedback`, `report_generated {source, model, promptVersion, thinking, notes, safetyFlag, error}`, `report_edited {fields}`, `report_released {safetyFlag}`, `print_requested`, `interrupted_restart`, `hardware_button`, `device_clock_reset`, `client_visibility`.
 
 ## responses.csv (session.json 의 `responses`)
 | 변수 | 의미 |
@@ -52,7 +52,11 @@
 - `answers {itemId: 1–5}`, `answerLatency`, `notes {questionId: text}`, `marks {questionId: {asked_end, answer_start, answer_end}}` (ms).
 - `scores {O,C,E,A,N}` 0–100 (요인당 2문항 미만이면 null), `scoreMissing`.
 - `metrics`: baseline, baselineSd, peak, samples, duration, quality(500<adc<65000 비율), categoryZ, contrasts, questionLatencyMedianMs, big5LatencyMedianMs, polarity, observedHz, missingSequenceCount.
-- `report {title, character, lackMeaning, oneLine, source: rules|claude|rules-fallback, model, promptVersion, error?}`.
+- `report {title, character, lackMeaning, takeHome, oneLine, codes, safetyFlag, safetyNote, held, source: rules|claude|rules-fallback, model, promptVersion, thinking, notes[], usage, error?, editedByOperator?, original?, reviewedByOperator?}`.
+  - `codes {lackDomain[], filledContext[], meaningSource[], affectTone}` — Claude 가 운영자 메모를 코드북 v2 로 분류한 값(최대 2개, 없으면 `none`). 코드북 라벨은 `engine.CODEBOOK`. 규칙 문장이면 `null`.
+  - `safetyFlag/safetyNote` — 위기 신호 의심. `held=true` 인 동안 태블릿 API(`?view=tablet` 또는 원격 IP)는 `report=null, reportHeld=true` 를 받는다. `release_report` 후 `held=false, reviewedByOperator=true`.
+  - `original` — 운영자가 `edit_report` 로 처음 수정할 때 보존되는 원문 5필드.
+  - sessions CSV 열: `prompt_version, take_home, code_lack, code_filled, code_meaning, affect_tone, safety_flag, edited_by_operator` (다중 코드는 `|` 구분).
 - `feedback {accuracy 1–5, resonant, reportSource, at}`.
 - `protocol` = `oriori-live-social-v2`, `instrument` = `mini-ipip-20-ko-unofficial`.
 

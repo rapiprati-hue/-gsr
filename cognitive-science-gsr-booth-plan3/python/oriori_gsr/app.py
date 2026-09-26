@@ -20,7 +20,7 @@ load_dotenv(ROOT / ".env")
 from flask import Flask, jsonify, request, send_from_directory, Response
 from engine import (DATA, Store, Collector, COURSES, PROTOCOL, INSTRUMENT, LABELS, RAW_FIELDS, EVENT_FIELDS, RESPONSE_FIELDS, BIG5_ITEMS, SCALE,
                     load_config, atomic_json, now, js_round, build_script, score_answers, reference_type, compute_features, qualitative_summary,
-                    rule_report, generate_report, llm_ready, send_receipt, DEMO_PULSE)
+                    rule_report, generate_report, llm_ready, llm_model, send_receipt, DEMO_PULSE, CODEBOOK)
 
 config = load_config()
 store = Store()
@@ -46,8 +46,16 @@ def base_url():
     return f"http://{lan_ip()}:{config['port']}"
 
 
-def public_session(s, with_script=False):
+def is_operator():
+    return ALLOW_REMOTE_OPERATOR or request.remote_addr in ("127.0.0.1", "::1")
+
+
+def public_session(s, with_script=False, for_operator=True):
     out = {k: v for k, v in s.items() if not k.startswith("_")}
+    if not for_operator and (s.get("report") or {}).get("held"):
+        # 안전 플래그: 운영자가 확인·공개하기 전에는 태블릿에 문장을 보내지 않는다.
+        out["report"] = None
+        out["reportHeld"] = True
     out.update(serverNow=round(time.time() * 1000), hostMs=store.host_ms() if store.active == s["id"] else None,
                paperWidth=config["paperWidth"], resultUrl=f"{base_url()}/result/{s['id']}", courseName=COURSES[s["course"]]["name"],
                referenceType=reference_type(s.get("scores")), summary=qualitative_summary(s) if s.get("metrics") else None)
@@ -73,7 +81,7 @@ def new_session(course):
 
 
 def operator():
-    if ALLOW_REMOTE_OPERATOR or request.remote_addr in ("127.0.0.1", "::1"):
+    if is_operator():
         return None
     return jsonify(error="운영 기능은 노트북의 localhost 에서만 쓸 수 있어요. 태블릿은 세션 QR 로 입장하세요."), 403
 
@@ -155,7 +163,7 @@ def workspace():
         return denied
     prefs = {"demo": config["mode"] == "demo", "printer": config["printer"], "paperWidth": config["paperWidth"], "serialPort": config["serialPort"], "baudRate": str(config["baudRate"]),
              "adcRisesWithArousal": bool(config.get("adcRisesWithArousal", True)), "schoolApprovalConfirmed": bool(config.get("schoolApprovalConfirmed")), "checklist": config.get("checklist", []), "prices": config["prices"]}
-    return jsonify(sessions=[public_session(s) for s in store.all()], settings=prefs, version="2.0.0", llmAvailable=llm_ready(), llmModel=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+    return jsonify(sessions=[public_session(s) for s in store.all()], settings=prefs, version="2.0.0", llmAvailable=llm_ready(), llmModel=llm_model(), llmThinking="disabled", codebook=CODEBOOK,
                    tabletBase=base_url(), devices={"pico": collector.status()["connected"], "printer": config["printer"] != "browser"}, active=store.active, courses=COURSES)
 
 
@@ -235,7 +243,8 @@ def finish(sid, s):
 def session_route(sid):
     s = store.get(sid)
     if request.method == "GET":
-        return jsonify(public_session(s, request.args.get("script") == "1"))
+        # 태블릿은 view=tablet 을 붙여 요청 → 운영 PC 에서 열어도(디버그 플래그 포함) 보류 문장을 받지 않는다.
+        return jsonify(public_session(s, request.args.get("script") == "1", is_operator() and request.args.get("view") != "tablet"))
     if request.method == "DELETE":
         denied = operator()
         if denied:
@@ -328,8 +337,30 @@ def session_route(sid):
             if store.active == sid:
                 store.active = None
                 store.pulses = []
+        elif action == "edit_report":
+            if s["status"] != "completed" or not s.get("report"):
+                raise ValueError("완료된 세션의 문장만 수정할 수 있어요.")
+            rep_ = dict(s["report"])
+            if not rep_.get("original"):
+                rep_["original"] = {k: rep_.get(k) for k in ("title", "character", "lackMeaning", "takeHome", "oneLine")}
+            for k, limit in (("title", 40), ("character", 900), ("lackMeaning", 900), ("takeHome", 120), ("oneLine", 80)):
+                if k in b:
+                    v = b[k]
+                    if v is not None and (not isinstance(v, str) or len(v) > limit):
+                        raise ValueError(f"{k} 길이를 확인하세요.")
+                    rep_[k] = v.strip() if isinstance(v, str) and v.strip() else None
+            if not rep_.get("character"):
+                raise ValueError("본문(character)은 비울 수 없어요.")
+            rep_["editedByOperator"] = True
+            s["report"] = rep_
+            store.event(sid, "report_edited", 0, {"fields": [k for k in ("title", "character", "lackMeaning", "takeHome", "oneLine") if k in b]})
+        elif action == "release_report":
+            if s["status"] != "completed" or not s.get("report"):
+                raise ValueError("완료된 세션이 아닙니다.")
+            s["report"] = {**s["report"], "held": False, "reviewedByOperator": True}
+            store.event(sid, "report_released", 0, {"safetyFlag": bool(s["report"].get("safetyFlag"))})
         elif action == "feedback":
-            if s["status"] != "completed":
+            if s["status"] != "completed" or (s.get("report") or {}).get("held"):
                 raise ValueError("완료된 세션만 평가할 수 있어요.")
             acc, res = b.get("accuracy"), b.get("resonant")
             if type(acc) is not int or not 1 <= acc <= 5 or (res is not None and (not isinstance(res, str) or len(res) > 300)):
@@ -339,7 +370,7 @@ def session_route(sid):
         else:
             raise ValueError("지원하지 않는 동작입니다.")
         store.save(s)
-    return jsonify(public_session(s))
+    return jsonify(public_session(s, False, is_operator()))
 
 
 @app.post("/api/sessions/<sid>/events")
@@ -368,7 +399,7 @@ def report(sid):
         s = store.get(sid)
         s.update(report=result, reportPending=False, _lastReport=time.time())
         store.save(s)
-        store.event(sid, "report_generated", 0, {"source": result["source"], "model": result.get("model"), "promptVersion": result.get("promptVersion"), "error": result.get("error")})
+        store.event(sid, "report_generated", 0, {"source": result["source"], "model": result.get("model"), "promptVersion": result.get("promptVersion"), "thinking": result.get("thinking"), "notes": result.get("notes"), "safetyFlag": result.get("safetyFlag"), "error": result.get("error")})
     return jsonify(report=result, reportPending=False)
 
 
@@ -431,13 +462,16 @@ def export():
         item_cols = [i["id"] for i in BIG5_ITEMS]
         writer.writerow(["id", "code", "course", "status", "demo", "created_at", "ai_consent", *LABELS, "reference_4letter", *item_cols, "baseline_adc", "baseline_sd", "quality_pct", "observed_hz",
                          "gaze_direct_z", "gaze_averted_z", "q_neutral_z", "q_self_z", "q_social_z", "i_lack_z", "i_filled_z", "i_meaning_z", "question_latency_median_ms", "big5_latency_median_ms",
-                         "report_source", "report_model", "report_title", "feedback_accuracy", "feedback_resonant", "research_consent"])
+                         "report_source", "report_model", "prompt_version", "report_title", "take_home", "code_lack", "code_filled", "code_meaning", "affect_tone", "safety_flag", "edited_by_operator",
+                         "feedback_accuracy", "feedback_resonant", "research_consent"])
         for s in selected:
             sc, m, cz, rep, fb = s.get("scores") or {}, s.get("metrics") or {}, (s.get("metrics") or {}).get("categoryZ") or {}, s.get("report") or {}, s.get("feedback") or {}
+            codes = rep.get("codes") or {}
             writer.writerow([s["id"], s["code"], s["course"], s["status"], s["demo"], s["createdAt"], s["aiConsent"], *[sc.get(k) for k in LABELS], reference_type(sc), *[(s.get("answers") or {}).get(c) for c in item_cols],
                              m.get("baseline"), m.get("baselineSd"), m.get("quality"), m.get("observedHz"), cz.get("gaze_direct"), cz.get("gaze_averted"), cz.get("question_neutral"), cz.get("question_self"), cz.get("question_social"),
                              cz.get("interview_lack"), cz.get("interview_filled"), cz.get("interview_meaning"), m.get("questionLatencyMedianMs"), m.get("big5LatencyMedianMs"),
-                             rep.get("source"), rep.get("model"), rep.get("title"), fb.get("accuracy"), fb.get("resonant"), False])
+                             rep.get("source"), rep.get("model"), rep.get("promptVersion"), rep.get("title"), rep.get("takeHome"), "|".join(codes.get("lackDomain") or []), "|".join(codes.get("filledContext") or []),
+                             "|".join(codes.get("meaningSource") or []), codes.get("affectTone"), rep.get("safetyFlag"), rep.get("editedByOperator"), fb.get("accuracy"), fb.get("resonant"), False])
     name = kind if kind in ("raw", "events", "responses") else "sessions"
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=oriori_gsr_{name}.csv"})
 
@@ -473,7 +507,7 @@ if __name__ == "__main__":
     print("\n=== oriori_gsr v2.0 ===", flush=True)
     print(f"Operator: http://127.0.0.1:{port}", flush=True)
     print(f"Tablet:   http://{host}:{port}/tablet   (같은 핫스팟, localhost 아님)", flush=True)
-    print(f"Mode: {config['mode']} | Claude: {'ON' if llm_ready() else 'OFF (.env 에 ANTHROPIC_API_KEY)'} | Data: {DATA}", flush=True)
+    print(f"Mode: {config['mode']} | Claude: {('ON · ' + llm_model() + ' · thinking off') if llm_ready() else 'OFF (.env 에 ANTHROPIC_API_KEY)'} | Data: {DATA}", flush=True)
     if ALLOW_REMOTE_OPERATOR:
         print("WARNING: ORIORI_ALLOW_REMOTE_OPERATOR=1 — 운영 API 가 네트워크에 열려 있습니다. 현장에서는 끄세요.", flush=True)
     print("이 창을 닫지 마세요. Ctrl+C 로 종료.\n", flush=True)

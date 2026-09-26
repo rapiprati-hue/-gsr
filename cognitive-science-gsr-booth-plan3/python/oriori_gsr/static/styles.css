@@ -76,3 +76,7 @@ label.field{display:block;font-size:12.5px;color:var(--muted);margin-bottom:4px;
 @media print{body{background:#fff}.no-print{display:none!important}.receipt{box-shadow:none;width:auto;padding:0}.receipt-wrap{padding:0}@page{margin:4mm}}
 .guide ol{padding-left:20px}.guide li{margin:8px 0}.guide code{background:#f1efe8;padding:1px 6px;border-radius:5px;font-size:12.5px}
 .wire{font-size:13.5px}.wire td,.wire th{padding:6px 8px}
+
+.alert{background:#fdf0ee;border:1px solid #f0c9c4;color:#7a2d26;border-radius:12px;padding:12px 14px;font-size:13.5px;margin-bottom:12px;line-height:1.6}
+.chips{margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}.chip{display:inline-block;padding:3px 10px;border-radius:999px;background:#f1efe8;font-size:12px}
+.report .take{margin-top:12px;padding:10px 12px;background:#fbf7f3;border-radius:10px}
